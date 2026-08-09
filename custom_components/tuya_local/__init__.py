@@ -13,6 +13,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.device_registry import (
+    async_get as async_get_device_registry,
+)
 from homeassistant.helpers.entity_registry import (
     async_get as async_get_entity_registry,
 )
@@ -1011,6 +1014,18 @@ async def async_migrate_entry(hass, entry: ConfigEntry):
             await async_migrate_entries(
                 hass, entry.entry_id, update_gateway_scoped_unique_id
             )
+            # Re-identify the existing device registry entry instead of letting
+            # setup create a fresh one.  Without this the original device is left
+            # behind with no entities, and its replacement starts with no area,
+            # no user assigned name, and a new device id that device based
+            # automations and dashboard cards no longer match.
+            dev_reg = async_get_device_registry(hass)
+            device = dev_reg.async_get_device(identifiers={(DOMAIN, old_device_id)})
+            if device:
+                dev_reg.async_update_device(
+                    device.id,
+                    new_identifiers={(DOMAIN, new_device_id)},
+                )
             hass.config_entries.async_update_entry(entry, unique_id=new_device_id)
         hass.config_entries.async_update_entry(entry, minor_version=22)
     return True
@@ -1064,10 +1079,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     _LOGGER.debug("Unloading entry for device: %s", device_id)
     config = entry.data
     domain_data = hass.data.get(DOMAIN, {})
-    data = domain_data.get(device_id)
-    if data is None:
-        await async_delete_device(hass, config)
-        return True
 
     device_conf = await hass.async_add_executor_job(
         get_config,
@@ -1077,13 +1088,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
         _LOGGER.error(NOT_FOUND, config[CONF_TYPE])
         return False
 
-    entities = {}
-    for e in device_conf.all_entities():
-        if e.config_id in data:
-            entities[e.entity] = True
-
-    for e in entities:
-        await hass.config_entries.async_forward_entry_unload(entry, e)
+    # Unload exactly the platforms async_setup_entry forwarded, whether or not
+    # the cached device data still exists.  A setup that fails part way through
+    # calls cleanup_failed_device(), which drops the hass.data entry; skipping
+    # the platform unload in that case left Home Assistant believing the
+    # platforms were still set up, so every later reload raised "Config entry
+    # ... has already been setup" and only a restart could recover the entry.
+    platforms = {e.entity for e in device_conf.all_entities()}
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
     await async_delete_device(hass, config)
     domain_data.pop(device_id, None)
@@ -1097,7 +1109,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     if not remaining:
         async_stop_discovery(hass)
 
-    return True
+    return unload_ok
 
 
 async def async_update_entry(hass: HomeAssistant, entry: ConfigEntry):
