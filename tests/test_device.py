@@ -756,3 +756,119 @@ async def test_refresh_error_914_stays_quiet_when_rotating_protocols(
         await subject.async_refresh()
 
     assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_restarts_after_unexpected_exit(subject, mocker):
+    """A generator that stops must not leave the device silent forever.
+
+    Nothing used to restart it: actually_start() only creates the task when
+    _refresh_task is unset, so the device stayed offline until Home Assistant
+    was restarted.
+    """
+    starts = 0
+
+    def make_generator():
+        nonlocal starts
+        starts += 1
+        if starts >= 2:
+            # Stop after proving it came back, so the loop can exit.
+            subject._running = False
+
+        async def generator():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        return generator()
+
+    mocker.patch.object(subject, "async_receive", side_effect=make_generator)
+    subject._RESTART_DELAY = 0
+    subject._running = True
+
+    await subject.receive_loop()
+
+    assert starts == 2
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_restart_does_not_delay_shutdown(subject, mocker):
+    """Shutdown must interrupt the restart backoff rather than wait it out.
+
+    A plain sleep would be awaited by async_stop() on every device, adding the
+    backoff to Home Assistant's shutdown time.
+    """
+
+    def make_generator():
+        async def generator():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        return generator()
+
+    mocker.patch.object(subject, "async_receive", side_effect=make_generator)
+    subject._RESTART_DELAY = 300
+    subject._running = True
+
+    task = asyncio.create_task(subject.receive_loop())
+    await asyncio.sleep(0)
+
+    subject._running = False
+    subject._stop_signal.set()
+
+    # Would take _RESTART_DELAY seconds without the stop signal.
+    await asyncio.wait_for(task, timeout=1)
+
+
+def test_release_connection_keeps_shared_socket_for_siblings(subject, mocker):
+    """Sub-devices share the gateway's single socket.
+
+    Closing it when one of them stops would strand the siblings: they fall back
+    from push to polling until they happen to reconnect.
+    """
+    parent = mocker.MagicMock()
+    subject._api.parent = parent
+
+    sibling = mocker.MagicMock()
+    sibling._api.parent = parent
+    sibling._running = True
+    subject._hass.data[DOMAIN] = {"sibling": {"device": sibling}}
+
+    subject._release_connection()
+
+    subject._api.set_socketPersistent.assert_called_with(False)
+    parent.set_socketPersistent.assert_not_called()
+
+
+def test_release_connection_closes_shared_socket_when_last(subject, mocker):
+    """The last sub-device on a gateway must still close the shared socket."""
+    parent = mocker.MagicMock()
+    subject._api.parent = parent
+
+    sibling = mocker.MagicMock()
+    sibling._api.parent = parent
+    sibling._running = False
+    subject._hass.data[DOMAIN] = {"sibling": {"device": sibling}}
+
+    subject._release_connection()
+
+    parent.set_socketPersistent.assert_called_once_with(False)
+
+
+def test_pause_frees_shared_socket_even_with_siblings(subject, mocker):
+    """pause() must release the gateway socket regardless of siblings.
+
+    The config flow pauses an existing device so it can test new connection
+    parameters; a Tuya device only accepts one local connection, so leaving the
+    shared socket open would make that test fail.
+    """
+    parent = mocker.MagicMock()
+    subject._api.parent = parent
+
+    sibling = mocker.MagicMock()
+    sibling._api.parent = parent
+    sibling._running = True
+    subject._hass.data[DOMAIN] = {"sibling": {"device": sibling}}
+
+    subject.pause()
+
+    parent.set_socketPersistent.assert_called_once_with(False)
