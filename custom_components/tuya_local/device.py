@@ -5,6 +5,7 @@ API for Tuya Local devices.
 import asyncio
 import logging
 from asyncio.exceptions import CancelledError
+from contextlib import suppress
 from threading import Lock
 from time import time
 
@@ -142,6 +143,9 @@ class TuyaLocalDevice(object):
             self._api.parent.set_socketRetryLimit(1)
 
         self._refresh_task = None
+        # Set on shutdown so a pending restart backoff can be interrupted
+        # immediately instead of delaying Home Assistant's shutdown.
+        self._stop_signal = asyncio.Event()
         self._protocol_configured = protocol_version
         self._poll_only = poll_only
         self._temporary_poll = False
@@ -159,6 +163,10 @@ class TuyaLocalDevice(object):
         self._FAKE_IT_TIMEOUT = 5
         self._CACHE_TIMEOUT = 30
         self._HEARTBEAT_INTERVAL = 5
+        # How long to wait before restarting the receive loop after it exits
+        # unexpectedly.  Matches the cache timeout, so a device that recovers
+        # is picked up on the next poll cycle it would have had anyway.
+        self._RESTART_DELAY = 30
         # More attempts are needed in auto mode so we can cycle through all
         # the possibilities a couple of times
         self._AUTO_CONNECTION_ATTEMPTS = len(API_PROTOCOL_VERSIONS) * 2 + 1
@@ -198,10 +206,44 @@ class TuyaLocalDevice(object):
         cached = self._get_cached_state()
         return len(cached) > 1 or cached.get("updated_at", 0) > 0
 
+    def _release_connection(self, force=False):
+        """Drop this device's persistent connection.
+
+        Sub-devices behind a gateway all share the parent's single socket, so
+        closing it takes the siblings down with it: they fall back from push to
+        polling until they happen to reconnect.  Only close the shared socket
+        once no sibling is still using it.
+
+        Pass force=True when the point is to free the connection for someone
+        else, as pause() does while the config flow tests new connection
+        parameters.  There the siblings losing the connection is the intent,
+        not a side effect.
+        """
+        self._api.set_socketPersistent(False)
+        parent = self._api.parent
+        if parent and (force or not self._siblings_running()):
+            parent.set_socketPersistent(False)
+
+    def _siblings_running(self):
+        """Another sub-device is still running on the same gateway connection."""
+        parent = self._api.parent
+        if not parent:
+            return False
+        for entry in self._hass.data.get(DOMAIN, {}).values():
+            if not isinstance(entry, dict):
+                continue
+            other = entry.get("device")
+            if other is None or other is self:
+                continue
+            if other._api.parent is parent and other._running:
+                return True
+        return False
+
     @callback
     def actually_start(self, event=None):
         _LOGGER.debug("Starting monitor loop for %s", self.name)
         self._running = True
+        self._stop_signal.clear()
         self._shutdown_listener = self._hass.bus.async_listen_once(
             EVENT_HOMEASSISTANT_STOP, self.async_stop
         )
@@ -224,12 +266,12 @@ class TuyaLocalDevice(object):
     async def async_stop(self, event=None):
         _LOGGER.debug("Stopping monitor loop for %s", self.name)
         self._running = False
+        # Interrupt a pending restart backoff so shutdown is not delayed.
+        self._stop_signal.set()
         self._children.clear()
         self._force_dps.clear()
         if self._refresh_task:
-            self._api.set_socketPersistent(False)
-            if self._api.parent:
-                self._api.parent.set_socketPersistent(False)
+            self._release_connection()
             await self._refresh_task
         _LOGGER.debug("Monitor loop for %s stopped", self.name)
         self._refresh_task = None
@@ -261,58 +303,79 @@ class TuyaLocalDevice(object):
                 pass
 
     async def receive_loop(self):
-        """Coroutine wrapper for async_receive generator."""
-        try:
-            async for poll in self.async_receive():
-                if isinstance(poll, dict):
-                    _LOGGER.debug(
-                        "%s received %s",
-                        self.name,
-                        log_json(poll),
-                    )
-                    full_poll = poll.pop("full_poll", False)
-                    self._cached_state = self._cached_state | poll
-                    self._cached_state["updated_at"] = time()
-                    self._remove_properties_from_pending_updates(poll)
+        """Coroutine wrapper for async_receive generator.
 
-                    for entity in self._children:
-                        # let entities trigger off poll contents directly
-                        try:
-                            entity.on_receive(poll, full_poll)
-                        except Exception as e:
-                            # Don't let exceptions thrown by the entities interrupt the communication loop
-                            # Just log them and move on.
-                            _LOGGER.exception(
-                                "%s on_receive error for entity %s: %s",
-                                self.name,
-                                entity.entity_id,
-                                e,
-                            )
-                        # clear non-persistant dps that were not in a full poll
-                        if full_poll:
-                            for dp in entity._config.dps():
-                                if not dp.persist and dp.id not in poll:
-                                    self._cached_state.pop(dp.id, None)
-                        entity.schedule_update_ha_state()
-                else:
-                    _LOGGER.debug(
-                        "%s received non data %s",
-                        self.name,
-                        log_json(poll),
-                    )
-            _LOGGER.warning("%s receive loop has terminated", self.name)
+        The generator can stop on an unexpected error, and previously nothing
+        restarted it: the device went offline and stayed there until Home
+        Assistant was restarted, because actually_start() only creates the task
+        when _refresh_task is unset.  Keep restarting it while the device is
+        running, so a transient failure resolves itself.
+        """
+        while self._running:
+            try:
+                async for poll in self.async_receive():
+                    if isinstance(poll, dict):
+                        _LOGGER.debug(
+                            "%s received %s",
+                            self.name,
+                            log_json(poll),
+                        )
+                        full_poll = poll.pop("full_poll", False)
+                        self._cached_state = self._cached_state | poll
+                        self._cached_state["updated_at"] = time()
+                        self._remove_properties_from_pending_updates(poll)
 
-        except Exception as t:
-            _LOGGER.exception(
-                "%s receive loop terminated by exception %s", self.name, t
-            )
-        finally:
-            # Ensure the persistent connection is closed when the loop exits
-            # and device appears as unavailable
-            self._api.set_socketPersistent(False)
-            if self._api.parent:
-                self._api.parent.set_socketPersistent(False)
-            self._reset_cached_state()
+                        for entity in self._children:
+                            # let entities trigger off poll contents directly
+                            try:
+                                entity.on_receive(poll, full_poll)
+                            except Exception as e:
+                                # Don't let exceptions thrown by the entities interrupt the communication loop
+                                # Just log them and move on.
+                                _LOGGER.exception(
+                                    "%s on_receive error for entity %s: %s",
+                                    self.name,
+                                    entity.entity_id,
+                                    e,
+                                )
+                            # clear non-persistant dps that were not in a full poll
+                            if full_poll:
+                                for dp in entity._config.dps():
+                                    if not dp.persist and dp.id not in poll:
+                                        self._cached_state.pop(dp.id, None)
+                            entity.schedule_update_ha_state()
+                    else:
+                        _LOGGER.debug(
+                            "%s received non data %s",
+                            self.name,
+                            log_json(poll),
+                        )
+                _LOGGER.warning("%s receive loop has terminated", self.name)
+
+            except Exception as t:
+                _LOGGER.exception(
+                    "%s receive loop terminated by exception %s", self.name, t
+                )
+            finally:
+                # Ensure the persistent connection is closed when the loop exits
+                # and device appears as unavailable
+                self._release_connection()
+                self._reset_cached_state()
+
+            if self._running:
+                _LOGGER.debug(
+                    "%s restarting receive loop in %d seconds",
+                    self.name,
+                    self._RESTART_DELAY,
+                )
+                # A plain sleep here would be awaited by async_stop() on every
+                # device, delaying shutdown by the backoff.  Waiting on the
+                # stop signal instead makes shutdown immediate.
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._stop_signal.wait(),
+                        self._RESTART_DELAY,
+                    )
 
     @property
     def should_poll(self):
@@ -321,9 +384,9 @@ class TuyaLocalDevice(object):
     def pause(self):
         self._temporary_poll = True
         _LOGGER.debug("%s pausing connection temporarily", self.name, False)
-        self._api.set_socketPersistent(False)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(False)
+        # force: the caller wants the connection freed for a new one, so on a
+        # gateway the siblings have to give it up too.
+        self._release_connection(force=True)
 
     def resume(self):
         self._temporary_poll = False
@@ -436,9 +499,7 @@ class TuyaLocalDevice(object):
                 # Close the persistent connection when exiting the loop
                 persist = False
                 _LOGGER.debug("%s receive loop interrupted", self.name)
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                self._release_connection()
                 raise
             except Exception as t:
                 _LOGGER.exception(
@@ -448,9 +509,7 @@ class TuyaLocalDevice(object):
                     t,
                 )
                 persist = False
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                self._release_connection()
                 force_backoff = True
             finally:
                 if self._api_lock.locked():
@@ -460,9 +519,7 @@ class TuyaLocalDevice(object):
             await asyncio.sleep(5 if force_backoff else 0.1)
 
         # Close the persistent connection when exiting the loop
-        self._api.set_socketPersistent(False)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(False)
+        self._release_connection()
 
     def set_detected_product_id(self, product_id):
         self._product_ids.append(product_id)
@@ -710,10 +767,10 @@ class TuyaLocalDevice(object):
                     i,
                     connections,
                 )
-                # Ensure we have a fresh connection for the next attempt
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                # Ensure we have a fresh connection for the next attempt.
+                # force: a fresh connection is the point here, so on a gateway
+                # the siblings have to give up the shared socket too.
+                self._release_connection(force=True)
 
                 if i + 1 == connections:
                     self._reset_cached_state()
