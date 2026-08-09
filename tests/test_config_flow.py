@@ -7,6 +7,7 @@ import voluptuous as vol
 from homeassistant.const import CONF_HOST, CONF_NAME
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -165,6 +166,91 @@ async def test_async_unload_entry_ignores_missing_device_data(hass):
     )
 
     assert await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_async_unload_entry_unloads_platforms_without_device_data(hass, mocker):
+    """Platforms must be unloaded even when the cached device data is gone.
+
+    A setup that fails part way through calls cleanup_failed_device(), which
+    drops the hass.data entry.  Skipping the platform unload in that case left
+    Home Assistant believing the platforms were still set up, so every later
+    reload raised "Config entry ... has already been setup" and only a restart
+    could recover the entry.
+    """
+
+    hass.data[DOMAIN] = {}
+    unload_platforms = mocker.patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=mocker.AsyncMock(return_value=True),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=13,
+        minor_version=18,
+        title="test",
+        data={
+            CONF_DEVICE_ID: "deviceid",
+            CONF_HOST: "hostname",
+            CONF_LOCAL_KEY: TESTKEY,
+            CONF_POLL_ONLY: False,
+            CONF_PROTOCOL_VERSION: 3.4,
+            CONF_TYPE: "kogan_kahtp_heater",
+        },
+        options={},
+    )
+
+    assert await async_unload_entry(hass, entry)
+
+    unload_platforms.assert_awaited_once()
+    unloaded_entry, platforms = unload_platforms.await_args.args
+    assert unloaded_entry is entry
+    assert "climate" in platforms
+
+
+@pytest.mark.asyncio
+async def test_migrate_entry_keeps_existing_device_for_subdevice(hass):
+    """Gateway scoping must re-identify the device, not orphan it.
+
+    The device registry entry carries the user's area assignment and custom
+    name, and its id is what device based automations and dashboard cards
+    reference.  Creating a replacement device would silently drop all three.
+    """
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=13,
+        minor_version=21,
+        unique_id="childid",
+        title="test",
+        data={
+            CONF_DEVICE_ID: "gatewayid",
+            CONF_DEVICE_CID: "childid",
+            CONF_HOST: "hostname",
+            CONF_LOCAL_KEY: TESTKEY,
+            CONF_POLL_ONLY: False,
+            CONF_PROTOCOL_VERSION: 3.3,
+            CONF_TYPE: "zigbee_zn373186_temphumid_sensor",
+        },
+        options={},
+    )
+    entry.add_to_hass(hass)
+
+    device_reg = dr.async_get(hass)
+    device = device_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "childid")},
+    )
+    device_reg.async_update_device(device.id, name_by_user="Kitchen sensor")
+
+    assert await async_migrate_entry(hass, entry)
+
+    migrated = device_reg.async_get_device(identifiers={(DOMAIN, "gatewayid/childid")})
+    assert migrated is not None
+    assert migrated.id == device.id
+    assert migrated.name_by_user == "Kitchen sensor"
+    assert device_reg.async_get_device(identifiers={(DOMAIN, "childid")}) is None
 
 
 @pytest.mark.asyncio
